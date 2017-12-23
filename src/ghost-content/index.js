@@ -146,11 +146,12 @@ module.exports = ({ logger, db, projectLocation, enabled }) => {
 
     const { normalizedFolderName } = normalizeFolder(rootFolder)
 
-    const id = await knex('ghost_content')
-      .where({ folder: normalizedFolderName, file })
-      .select('id')
-      .get(0)
-      .get('id')
+    const id = get(
+      await knex('ghost_content')
+        .where({ folder: normalizedFolderName, file })
+        .select('id'),
+      '0.id'
+    )
 
     if (!id) {
       throw new Error(
@@ -193,6 +194,16 @@ module.exports = ({ logger, db, projectLocation, enabled }) => {
       .get('content')
   }
 
+  const directoryListing = async (rootFolder, fileEndingPattern = '') => {
+    const knex = await db.get()
+    const { normalizedFolderName } = normalizeFolder(rootFolder)
+    return knex('ghost_content')
+      .select('file')
+      .where({ folder: normalizedFolderName })
+      .andWhere('file', 'like', `%${fileEndingPattern}`)
+      .then(res => res.map(row => row.file))
+  }
+
   const getPending = () => pendingRevisionsByFolder
 
   const getPendingWithContentForFolder = async (folderInfo, normalizedFolderName) => {
@@ -219,6 +230,7 @@ module.exports = ({ logger, db, projectLocation, enabled }) => {
     addRootFolder,
     recordRevision,
     readFile,
+    directoryListing,
     getPending,
     getPendingWithContent
   }

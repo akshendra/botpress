@@ -9,7 +9,7 @@ import mkdirp from 'mkdirp'
 import { validateFlowSchema } from './validator'
 
 export default class FlowProvider extends EventEmitter2 {
-  constructor({ logger, botfile, projectLocation }) {
+  constructor({ logger, botfile, projectLocation, ghostManager }) {
     super({
       wildcard: true,
       maxListeners: 100
@@ -18,80 +18,67 @@ export default class FlowProvider extends EventEmitter2 {
     this.logger = logger
     this.botfile = botfile
     this.projectLocation = projectLocation
+    this.ghostManager = ghostManager
   }
 
   async loadAll() {
     const relDir = this.botfile.flowsDir || './flows'
-    const flowsDir = path.resolve(this.projectLocation, relDir)
+    const flowFiles = await this.ghostManager.directoryListing(relDir, '.flow.json')
 
-    if (!fs.existsSync(flowsDir)) {
-      return []
-    }
+    const flows = await Promise.all(
+      flowFiles.map(async name => {
+        const uiFileName = name.replace(/\.flow/g, '.ui')
+        const flow = JSON.parse(await this.ghostManager.readFile(relDir, name))
 
-    const searchOptions = { cwd: flowsDir }
+        const schemaError = validateFlowSchema(flow)
+        if (!flow || schemaError) {
+          return flow ? this.logger.warn(schemaError) : null
+        }
 
-    const flowFiles = await Promise.fromCallback(callback => glob('**/*.flow.json', searchOptions, callback))
+        const uiEq = JSON.parse(await this.ghostManager.readFile(relDir, uiFileName))
 
-    const flows = []
+        Object.assign(flow, { links: uiEq.links })
 
-    flowFiles.forEach(file => {
-      const filePath = path.resolve(flowsDir, './' + file)
-      const flow = JSON.parse(fs.readFileSync(filePath))
+        // TODO: refactor to separate function
+        // Take position from UI files or create default position
+        const unplacedNodes = []
+        flow.nodes.forEach(node => {
+          const uiNode = _.find(uiEq.nodes, { id: node.id }) || {}
 
-      flow.name = file // e.g. 'login.flow.json' or 'shapes/circle.flow.json'
+          Object.assign(node, uiNode.position)
 
-      const schemaError = validateFlowSchema(flow)
-      if (schemaError) {
-        return this.logger.warn(schemaError)
-      }
+          if (_.isNil(node.x) || _.isNil(node.y)) {
+            unplacedNodes.push(node)
+          }
+        })
 
-      const uiEqPath = path.resolve(flowsDir, './' + file.replace(/\.flow/g, '.ui'))
-      let uiEq = {}
+        const unplacedY = (_.maxBy(flow.nodes, 'y') || { y: 0 }).y + 250
+        let unplacedX = 50
 
-      if (fs.existsSync(uiEqPath)) {
-        uiEq = JSON.parse(fs.readFileSync(uiEqPath))
-      }
+        unplacedNodes.forEach(node => {
+          node.y = unplacedY
+          node.x = unplacedX
+          unplacedX += 250
+        })
 
-      Object.assign(flow, { links: uiEq.links })
-
-      // Take position from UI files or create default position
-      const unplacedNodes = []
-      flow.nodes.forEach(node => {
-        const uiNode = _.find(uiEq.nodes, { id: node.id }) || {}
-
-        Object.assign(node, uiNode.position)
-
-        if (_.isNil(node.x) || _.isNil(node.y)) {
-          unplacedNodes.push(node)
+        return {
+          name,
+          location: name,
+          nodes: _.filter(flow.nodes, node => !!node),
+          ..._.pick(flow, 'version', 'catchAll', 'startNode', 'links', 'skillData')
         }
       })
+    )
 
-      const unplacedY = (_.maxBy(flow.nodes, 'y') || { y: 0 }).y + 250
-      let unplacedX = 50
-
-      unplacedNodes.forEach(node => {
-        node.y = unplacedY
-        node.x = unplacedX
-        unplacedX += 250
-      })
-
-      return flows.push({
-        location: file,
-        version: flow.version,
-        name: flow.name,
-        nodes: _.filter(flow.nodes, node => !!node),
-        catchAll: flow.catchAll,
-        startNode: flow.startNode,
-        links: flow.links,
-        skillData: flow.skillData
-      })
-    })
-
-    return flows
+    return flows.filter(flow => Boolean(flow))
   }
 
   async saveFlows(flows) {
     const flowsToSave = await Promise.mapSeries(flows, flow => this._prepareSaveFlow(flow))
+
+    const flowsDir = this.botfile.flowsDir || './flows'
+    mkdirp.sync(path.dirname(flowsDir))
+    await this.ghostManager.addRootFolder(flowsDir, '**/*.json')
 
     for (const { flowPath, uiPath, flowContent, uiContent } of flowsToSave) {
       if (flowPath.includes('/')) {
@@ -100,17 +87,23 @@ export default class FlowProvider extends EventEmitter2 {
 
       fs.writeFileSync(flowPath, JSON.stringify(flowContent, null, 2))
       fs.writeFileSync(uiPath, JSON.stringify(uiContent, null, 2))
+
+      const flowFileName = flowPath.split('/')[flowPath.split('/').length - 1]
+      const uiFileName = uiPath.split('/')[uiPath.split('/').length - 1]
+      this.ghostManager.recordRevision(flowsDir, flowFileName, JSON.stringify(flowContent, null, 2))
+      this.ghostManager.recordRevision(flowsDir, uiFileName, JSON.stringify(uiContent, null, 2))
     }
 
-    const flowsDir = path.resolve(this.projectLocation, this.botfile.flowsDir || './flows')
-
-    const searchOptions = { cwd: flowsDir }
-    const flowFiles = await Promise.fromCallback(callback => glob('**/*.flow.json', searchOptions, callback))
+    const searchOptions = { cwd: path.resolve(this.projectLocation, flowsDir) }
+    const flowFiles = await this.ghostManager.directoryListing(flowsDir, '.flow.json')
 
     flowFiles
-      .map(fileName => path.resolve(flowsDir, './' + fileName))
-      .filter(filePath => !flowsToSave.find(flow => flow.flowPath === filePath || flow.uiPath === filePath))
-      .map(filePath => fs.unlinkSync(filePath))
+      .map(fileName => [fileName, path.resolve(this.projectLocation, flowsDir, './' + fileName)])
+      .filter(([, filePath]) => !flowsToSave.find(flow => flow.flowPath === filePath || flow.uiPath === filePath))
+      .map(([fileName, filePath]) => {
+        fs.unlinkSync(filePath)
+        this.ghostManager.recordRevision(flowsDir, fileName, null)
+      })
 
     this.emit('flowsChanged')
   }
